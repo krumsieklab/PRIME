@@ -2,4 +2,4 @@
 
 PRotein Inference from MEtabolomics
 
-Other information
+And protein protein interaction networks

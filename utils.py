@@ -163,15 +163,21 @@ class LoadData():
 from sklearn.model_selection import KFold
 from scipy.stats import pearsonr
 import seaborn as sns
+import torch
+import torch.nn as nn
+import pytorch_lightning as pl
+import torch.optim as optim
+from torch.utils.data import TensorDataset, DataLoader
+import copy
 class CV():
-    def __init__(self, met, prot, p_cols = None, protein_dict = None, m_cols = None, n = 5):
-        self.met = met
-        self.prot = prot
+    def __init__(self, dataloader, n = 5):
+        self.met = dataloader.m
+        self.prot = dataloader.p
         # self.n = n
         self.predict = np.zeros(self.prot.shape)
-        self.p_dict = protein_dict
-        self.p_cols = p_cols
-        self.m_cols = m_cols
+        self.p_dict = dataloader.p_dict
+        self.p_cols = dataloader.p_cols
+        self.m_cols = dataloader.m_cols
         self.folds(n = n)
         
     def folds(self, n = 5, random_state = 42):
@@ -211,6 +217,64 @@ class CV():
             predicts = model.predict(m_test)
             self.save_out(predicts, fold)
         return self.predict
+    
+    def train_loop_pl(self, model = None, device = 'cuda', batch_size = 128, input_dim = 251, output_dim = 1039, hidden_dims = [512, 512], custom_layers = None):
+        #first thing we need to do is to create the dataset and dataloader
+        self.device = device
+        self.batch_size = batch_size
+        
+        if model is None:
+            model = self.default_model(input_dim, output_dim, hidden_dims, custom_layers)
+        torch.set_float32_matmul_precision('medium')
+        self.model = model
+        
+        for fold, idx in tqdm(enumerate(self.fold_list), desc="Training Folds", total=len(self.fold_list)):
+            test_idx = idx
+            #X_train = self.met.drop(test_idx, axis = 0)
+            m_train = np.delete(self.met, test_idx, axis = 0)
+            m_test = self.met[test_idx,:]
+            p_train = np.delete(self.prot, test_idx, axis = 0)
+            p_test = self.prot[test_idx,:]
+            train_loader = self.data_loader(m_train, p_train, 'train')
+            test_loader = self.data_loader(m_test, p_test, 'test')
+            
+            if fold == 0:
+                trainer = pl.Trainer(max_epochs=10, accelerator='gpu', devices=1)
+            else:
+                trainer = pl.Trainer(max_epochs=10, accelerator='gpu', devices=1, enable_progress_bar=False, logger=False, progress_bar_refresh_rate=0)
+                        
+            model = copy.deepcopy(self.model)
+                        
+            trainer.fit(model, train_loader, test_loader)
+            
+            pred = trainer.predict(model, test_loader)
+            pred = torch.cat(pred, dim=0).cpu().numpy()
+            #save out the data
+            self.save_out(pred, fold)
+        
+        return None
+        
+    def data_loader(self, m, p, type = 'test'):
+        X = torch.tensor(m, dtype=torch.float32).to(self.device)
+        y = torch.tensor(p, dtype=torch.float32).to(self.device)
+        dataset = TensorDataset(X, y)
+        if type == 'test':
+            dataloader = DataLoader(dataset, batch_size=self.batch_size, shuffle=False)
+        if type == 'train':
+            dataloader = DataLoader(dataset, batch_size=self.batch_size, shuffle=True)
+        return dataloader
+    
+    def default_model(self, input_dim, output_dim, hidden_dims=[512, 512], custom_layers=None):
+        model = LinearNet(input_dim=input_dim, output_dim=output_dim, hidden_dims=hidden_dims, custom_layers=custom_layers)
+        #to do custom layers use this
+        # custom_layers = nn.Sequential(
+        #     nn.Linear(251, 256),
+        #     nn.ReLU(),
+        #     nn.Linear(256, 128),
+        #     nn.ReLU(),
+        #     nn.Linear(128, 1039)
+        # )
+        return model
     
     def idx_plot(self, feature_list = None):
         #plots the best ones corresponding to the indices, and by default it will plot the 4 most correlated ones
@@ -301,3 +365,150 @@ class CV():
         #loads in the file
         self.predict = np.load(f'/home/sat4017/PRIME/saved_data/{name}')
         return None
+    
+    def remove_cols(self, col_labels):
+        #this function removes the columns from the data, this is if there are certain proteins not in our ppi network
+        #actually this function may indeed be useless
+        idx_rm = np.where(np.isin(self.p_cols, col_labels))[0]
+        self.p_cols = np.delete(self.p_cols, idx_rm)
+        self.prot = np.delete(self.prot, idx_rm, axis = 1)
+        self.predict = np.zeros(self.prot.shape) #reinitialize it cuz now different size
+
+class LinearNet(pl.LightningModule):
+    def __init__(self, input_dim=251, output_dim=1039, hidden_dims=[512, 512], custom_layers=None):
+        super(LinearNet, self).__init__()
+        
+        # Use custom layers if provided
+        if custom_layers:
+            self.layers = custom_layers
+        else:
+            all_layers = []
+            last_dim = input_dim
+            for hidden_dim in hidden_dims:
+                all_layers.extend([nn.Linear(last_dim, hidden_dim), nn.ReLU()])
+                last_dim = hidden_dim
+            all_layers.append(nn.Linear(last_dim, output_dim))
+            self.layers = nn.Sequential(*all_layers)
+        
+        self.losses = []
+
+    def forward(self, x):
+        x = self.layers(x)
+        return x
+
+    def training_step(self, batch, batch_idx):
+        x, y = batch
+        y_hat = self(x)
+        loss = nn.MSELoss()(y_hat, y)
+        self.log('train_loss', loss)
+        return loss
+
+    def validation_step(self, batch, batch_idx):
+        x, y = batch
+        y_hat = self(x)
+        loss = nn.MSELoss()(y_hat, y)
+        self.log('val_loss', loss)
+        return loss
+
+    def configure_optimizers(self):
+        optimizer = torch.optim.Adam(self.parameters(), lr=0.001)
+        return optimizer
+    
+    def test_step(self, batch, batch_idx):
+        x, y = batch
+        y_hat = self(x)
+        loss = nn.MSELoss()(y_hat, y)
+        self.losses.append(loss)
+        return {'test_loss': loss}, y_hat
+
+    def on_test_end(self):
+        avg_loss = torch.stack([x for x in self.losses]).mean()
+        print(f'avg_test_loss: {avg_loss}')
+        #self.log('avg_test_loss', avg_loss)
+        
+    def predict_step(self, batch, batch_idx):
+        x, _ = batch
+        outputs = self(x)
+        return outputs
+class PPI():
+    #this class serves as the major class for dealing with the ppi network, uses the same dataloader
+    def __init__(self, dataloader, infofile = '9606.protein.info.v12.0.txt', ppi_file = '9606.protein.links.v12.0.txt'):
+        self.met = dataloader.m
+        self.prot = dataloader.p
+        self.p_dict = dataloader.p_dict
+        self.p_cols = dataloader.p_cols
+        self.m_cols = dataloader.m_cols
+        self.load_info_and_match(textfile=infofile)
+        self.load_ppi(textfile=ppi_file)
+        
+        
+    def load_info_and_match(self, textfile = '9606.protein.info.v12.0.txt'):
+        #loads in the protein names and ensemble IDs, and removes from the self.prot what isnt' already in the ppi network
+        ppi_infodict = {}
+
+        with open(textfile, 'r') as file:
+            # Skip the header
+            next(file)
+            
+            # Iterate over lines
+            for line in file:
+                parts = line.split('\t')
+                
+                # If there are at least two parts
+                if len(parts) >= 2:
+                    key = parts[1]
+                    value = parts[0]
+                    ppi_infodict[key] = value
+        
+        col_remove = []
+        for p_idx in self.p_dict.keys():
+            if self.p_dict[p_idx][0] not in ppi_infodict.keys() and p_idx in self.p_cols:
+                col_remove.append(p_idx)
+                #print(self.p_dict[p_idx][0])
+                
+        self.remove_cols(col_remove)
+        
+        self.ppi_p2e = ppi_infodict
+        
+        self.ppi_e2p = {}
+        
+        for key in ppi_infodict.keys():
+            self.ppi_e2p[ppi_infodict[key]] = key
+        
+    def load_ppi(self, textfile = '9606.protein.links.v12.0.txt'):
+        #need to first find the size of the matrix which is going to be self.prot.shape[1] by self.prot.shape[1]
+        #then we will need to fill in the matrix with the values, by finding the associated protein name and then finding the column number, which is the associated key in self.prot_dict
+        #make a prot dict that is inverse of that, so we don't search each
+        self.ppi = np.zeros((self.prot.shape[1], self.prot.shape[1]))
+        
+        # #now develop a dictionary that is the inverse of the protein name
+        self.p_inv_dict = {}
+        for val in self.p_dict:
+            self.p_inv_dict[self.p_dict[val][0]] = val
+            
+        with open(textfile, 'r') as file:
+            # Skip the header
+            next(file)
+            
+            # Iterate over lines
+            for line in file:
+                parts = line.split(' ')
+                
+                # If there are at least two parts
+                if len(parts) >= 2:
+                    key1 = self.ppi_e2p[parts[0]]
+                    key2 = self.ppi_e2p[parts[1]]
+                    value = parts[2][:-1] #defines keys and values
+                    if key1 in self.p_inv_dict and key2 in self.p_inv_dict: #first makes sure it exists in there
+                        t1 = self.p_inv_dict[key1]
+                        t2 = self.p_inv_dict[key2]
+                        if t1 in self.p_cols and t2 in self.p_cols:    
+                            idx1 = np.where(self.p_cols == int(t1))[0][0] #finds the index of protein 1
+                            idx2 = np.where(self.p_cols == int(t2))[0][0] #and for protein 2
+                            self.ppi[idx1, idx2] = value #finally assigns it to 1,2
+                            # self.ppi[idx2, idx1] = value #here assigns it to 2,1 assumes symmetrical, we not assuming that
+        
+    def remove_cols(self,col_labels):
+        idx_rm = np.where(np.isin(self.p_cols, col_labels))[0]
+        self.p_cols = np.delete(self.p_cols, idx_rm)
+        self.prot = np.delete(self.prot, idx_rm, axis = 1)

@@ -5,6 +5,7 @@ import matplotlib.pyplot as plt
 import pandas as pd
 import csv
 from tqdm import tqdm
+import json
 
 def plot(data, labels = None, plottype = 0, feature_list = None, col_nums = None, datatype = 'met'):
     if plottype == 'samples':
@@ -54,15 +55,22 @@ def plot(data, labels = None, plottype = 0, feature_list = None, col_nums = None
 from sklearn.impute import SimpleImputer
 from sklearn.impute import KNNImputer
 class LoadData():
-    def __init__(self, filemet = 'UKBB_300K_Overlapping_MET.csv', fileprot = 'UKBB_300K_Overlapping_OLINK.csv', preprocess = True, impute = None, removenan = True, load = False):
+    def __init__(self, filemet = 'UKBB_300K_Overlapping_MET.csv', fileprot = 'UKBB_300K_Overlapping_OLINK.csv', preprocess = True, impute = None, removenan = True, load = False, load_demo_dict = True):
         
         #reads in the files and separates the data from the column labels
         met = pd.read_csv(f'/home/sat4017/PRIME/{filemet}', index_col = 0)
         prot = pd.read_csv(f'/home/sat4017/PRIME/{fileprot}', index_col = 0)
         self.p_cols = prot.columns.to_numpy().astype('float64')
         self.m_cols = met.columns.to_numpy() #not making float64 because has the X in it and some weird naming scheme, will not save it out for now we also don't delete metabolites, so use the full one
+        self.patient_ids = met.index.to_numpy()
         met = met.to_numpy()
         prot = prot.to_numpy()
+        #saved for the 25818 patients, but can make it modular.
+        #saved in the format of dict[eid] = [sex,bmi,age]
+        if load_demo_dict:
+            with open('/home/sat4017/PRIME/saved_data/demographic_dict.json') as json_file:
+                data = json.load(json_file)
+            self.demo_dict = {int(key): value for key, value in data.items()}
         
         if preprocess and not load: #if we are doing any preprocessing steps like z score
             prot = self.preprocessor(prot, datatype = 'prot', impute = impute, removenan = removenan)
@@ -132,6 +140,7 @@ class LoadData():
         #this function does what I propose
         row_nan_count = np.isnan(array).sum(axis=1)
         self.rowkeep = np.where(row_nan_count <= row_threshold)[0]
+        self.patient_ids = self.patient_ids[self.rowkeep]
         filtered_array_by_row = array[row_nan_count <= row_threshold, :]
         
         col_nan_count = np.isnan(filtered_array_by_row).sum(axis=0)
@@ -151,6 +160,7 @@ class LoadData():
         np.save(f'/home/sat4017/PRIME/saved_data/{name_met}', self.m)
         np.save(f'/home/sat4017/PRIME/saved_data/{name_prot}', self.p)
         np.save(f'/home/sat4017/PRIME/saved_data/{name_pcols}', self.p_cols)
+        np.save(f'/home/sat4017/PRIME/saved_data/patient_ids', self.patient_ids)
         return None
         
     def loadfile(self, name_met = 'm_knn.npy', name_prot = 'p_knn.npy', name_pcols = 'p_cols.npy'):
@@ -158,17 +168,32 @@ class LoadData():
         self.m = np.load(f'/home/sat4017/PRIME/saved_data/{name_met}')
         self.p = np.load(f'/home/sat4017/PRIME/saved_data/{name_prot}')
         self.p_cols = np.load(f'/home/sat4017/PRIME/saved_data/{name_pcols}')
+        self.patient_ids = np.load(f'/home/sat4017/PRIME/saved_data/patient_ids.npy')
         return None
     
 from sklearn.model_selection import KFold
 from scipy.stats import pearsonr
 import seaborn as sns
-import torch
-import torch.nn as nn
-import pytorch_lightning as pl
-import torch.optim as optim
-from torch.utils.data import TensorDataset, DataLoader
 import copy
+
+torch_available = False
+
+try:
+    import torch
+    torch_available = True
+except ImportError:
+    pass
+
+if torch_available:
+    import torch
+    import torch.nn as nn
+    import pytorch_lightning as pl
+    from torch.utils.data import TensorDataset, DataLoader
+    import warnings
+    warnings.filterwarnings("ignore", category=UserWarning, module='pytorch_lightning')
+
+#import wandb
+
 class CV():
     def __init__(self, dataloader, n = 5):
         self.met = dataloader.m
@@ -178,7 +203,10 @@ class CV():
         self.p_dict = dataloader.p_dict
         self.p_cols = dataloader.p_cols
         self.m_cols = dataloader.m_cols
+        self.patient_ids = dataloader.patient_ids
+        self.demo_dict = dataloader.demo_dict
         self.folds(n = n)
+        self.wandb = False #sets it to false by default, but if we want to use wandb, we can set it to true later
         
     def folds(self, n = 5, random_state = 42):
         #first we shuffle the data, then we return the folds, also use a random state
@@ -204,7 +232,9 @@ class CV():
         self.predict[self.fold_list[fold],:] = predicts #basically it assigns it to the proper one, definitiley check, likely bug!
         
     def train_loop(self, model):
-        
+        if self.wandb:
+            self.wandb_init('PRIME', {'batch_size': 128, 'input_dim': 251, 'output_dim': 1039, 'hidden_dims': [512, 512]})
+            #need to change... but here's the setup
         for fold, idx in tqdm(enumerate(self.fold_list), desc="Training Folds", total=len(self.fold_list)):
             test_idx = idx
             #X_train = self.met.drop(test_idx, axis = 0)
@@ -215,6 +245,14 @@ class CV():
             model.fit(m_train, p_train)
             #model.fit(self.met[train_idx,:], self.prot[train_idx,:])
             predicts = model.predict(m_test)
+            # if self.wandb:
+            #     #log the mse
+            #     mse = np.mean((self.prot[test_idx,:] - predicts)**2, axis = 0)
+            #     for i in range(len(mse)):
+            #         self.wandb_log({'mse': mse[i]})
+                    
+                #need to load it in differently and find a better way to save it out
+                #also have to alter it in train_loop_pl
             self.save_out(predicts, fold)
         return self.predict
     
@@ -222,6 +260,8 @@ class CV():
         #first thing we need to do is to create the dataset and dataloader
         self.device = device
         self.batch_size = batch_size
+        # if self.wandb:
+        #     self.wandb_init('PRIME', {'batch_size': batch_size, 'input_dim': input_dim, 'output_dim': output_dim, 'hidden_dims': hidden_dims})
         
         if model is None:
             model = self.default_model(input_dim, output_dim, hidden_dims, custom_layers)
@@ -241,7 +281,7 @@ class CV():
             if fold == 0:
                 trainer = pl.Trainer(max_epochs=10, accelerator='gpu', devices=1)
             else:
-                trainer = pl.Trainer(max_epochs=10, accelerator='gpu', devices=1, enable_progress_bar=False, logger=False, progress_bar_refresh_rate=0)
+                trainer = pl.Trainer(max_epochs=10, accelerator='gpu', devices=1, enable_progress_bar=False, logger=False)
                         
             model = copy.deepcopy(self.model)
                         
@@ -250,6 +290,11 @@ class CV():
             pred = trainer.predict(model, test_loader)
             pred = torch.cat(pred, dim=0).cpu().numpy()
             #save out the data
+            # if self.wandb:
+            #     #log the mse
+            #     mse = np.mean((self.prot[test_idx,:] - pred)**2, axis = 0)
+            #     for i in range(len(mse)):
+            #         self.wandb_log({'mse': mse[i]})
             self.save_out(pred, fold)
         
         return None
@@ -373,63 +418,94 @@ class CV():
         self.p_cols = np.delete(self.p_cols, idx_rm)
         self.prot = np.delete(self.prot, idx_rm, axis = 1)
         self.predict = np.zeros(self.prot.shape) #reinitialize it cuz now different size
-
-class LinearNet(pl.LightningModule):
-    def __init__(self, input_dim=251, output_dim=1039, hidden_dims=[512, 512], custom_layers=None):
-        super(LinearNet, self).__init__()
         
-        # Use custom layers if provided
-        if custom_layers:
-            self.layers = custom_layers
-        else:
-            all_layers = []
-            last_dim = input_dim
-            for hidden_dim in hidden_dims:
-                all_layers.extend([nn.Linear(last_dim, hidden_dim), nn.ReLU()])
-                last_dim = hidden_dim
-            all_layers.append(nn.Linear(last_dim, output_dim))
-            self.layers = nn.Sequential(*all_layers)
-        
-        self.losses = []
-
-    def forward(self, x):
-        x = self.layers(x)
-        return x
-
-    def training_step(self, batch, batch_idx):
-        x, y = batch
-        y_hat = self(x)
-        loss = nn.MSELoss()(y_hat, y)
-        self.log('train_loss', loss)
-        return loss
-
-    def validation_step(self, batch, batch_idx):
-        x, y = batch
-        y_hat = self(x)
-        loss = nn.MSELoss()(y_hat, y)
-        self.log('val_loss', loss)
-        return loss
-
-    def configure_optimizers(self):
-        optimizer = torch.optim.Adam(self.parameters(), lr=0.001)
-        return optimizer
+    def demographic_vec(self, demo):
+        #this will take in the demographic information and gives you the vector based on the patient ids and the demo_dict
+        demo_list = ['sex','bmi','age']
+        #find which one demo ois in the list
+        demo_idx = demo_list.index(demo)
+        demo_vec = np.zeros(self.prot.shape[0])
+        #and now we loop through
+        for i, patient_id in enumerate(self.patient_ids):
+            demo_vec[i] = self.demo_dict[patient_id][demo_idx]
+        return demo_vec
     
-    def test_step(self, batch, batch_idx):
-        x, y = batch
-        y_hat = self(x)
-        loss = nn.MSELoss()(y_hat, y)
-        self.losses.append(loss)
-        return {'test_loss': loss}, y_hat
+    def wandb_init(self, project_name, config_params):
+        self.wandb = True
+        #import wandb
+        wandb.init(project=project_name, config=config_params)
+        return None
+    
+    def wandb_log(self, log_dict):
+        wandb.log(log_dict)
+        return None
+    
+    def wandb_finish(self):
+        wandb.finish()
 
-    def on_test_end(self):
-        avg_loss = torch.stack([x for x in self.losses]).mean()
-        print(f'avg_test_loss: {avg_loss}')
-        #self.log('avg_test_loss', avg_loss)
+
+if torch_available:
+    class LinearNet(pl.LightningModule):
+        def __init__(self, input_dim=251, output_dim=1039, hidden_dims=[512, 512], custom_layers=None):
+            super(LinearNet, self).__init__()
+            
+            # Use custom layers if provided
+            if custom_layers:
+                self.layers = custom_layers
+            else:
+                all_layers = []
+                last_dim = input_dim
+                for hidden_dim in hidden_dims:
+                    all_layers.extend([nn.Linear(last_dim, hidden_dim), nn.ReLU()])
+                    last_dim = hidden_dim
+                all_layers.append(nn.Linear(last_dim, output_dim))
+                self.layers = nn.Sequential(*all_layers)
+            
+            self.losses = []
+
+        def forward(self, x):
+            x = self.layers(x)
+            return x
+
+        def training_step(self, batch, batch_idx):
+            x, y = batch
+            y_hat = self(x)
+            loss = nn.MSELoss()(y_hat, y)
+            self.log('train_loss', loss)
+            return loss
+
+        def validation_step(self, batch, batch_idx):
+            x, y = batch
+            y_hat = self(x)
+            loss = nn.MSELoss()(y_hat, y)
+            self.log('val_loss', loss)
+            return loss
+
+        def configure_optimizers(self):
+            optimizer = torch.optim.Adam(self.parameters(), lr=0.001)
+            return optimizer
         
-    def predict_step(self, batch, batch_idx):
-        x, _ = batch
-        outputs = self(x)
-        return outputs
+        def test_step(self, batch, batch_idx):
+            x, y = batch
+            y_hat = self(x)
+            loss = nn.MSELoss()(y_hat, y)
+            self.losses.append(loss)
+            return {'test_loss': loss}, y_hat
+
+        def on_test_end(self):
+            avg_loss = torch.stack([x for x in self.losses]).mean()
+            print(f'avg_test_loss: {avg_loss}')
+            #self.log('avg_test_loss', avg_loss)
+            
+        def predict_step(self, batch, batch_idx):
+            x, _ = batch
+            outputs = self(x)
+            return outputs
+        
+        
+    class CNNNet(pl.LightningModule):
+        def __init__(self, input_dim=251, output_dim=1039, custom_layers=None):
+            return None
 class PPI():
     #this class serves as the major class for dealing with the ppi network, uses the same dataloader
     def __init__(self, dataloader, infofile = '9606.protein.info.v12.0.txt', ppi_file = '9606.protein.links.v12.0.txt'):
@@ -438,6 +514,8 @@ class PPI():
         self.p_dict = dataloader.p_dict
         self.p_cols = dataloader.p_cols
         self.m_cols = dataloader.m_cols
+        self.patient_ids = dataloader.patient_ids
+        self.demo_dict = dataloader.demo_dict
         self.load_info_and_match(textfile=infofile)
         self.load_ppi(textfile=ppi_file)
         
@@ -508,7 +586,40 @@ class PPI():
                             self.ppi[idx1, idx2] = value #finally assigns it to 1,2
                             # self.ppi[idx2, idx1] = value #here assigns it to 2,1 assumes symmetrical, we not assuming that
         
+        #now create the mask
+        self.mask = (self.ppi != 0).astype(int)
+
+        
     def remove_cols(self,col_labels):
         idx_rm = np.where(np.isin(self.p_cols, col_labels))[0]
         self.p_cols = np.delete(self.p_cols, idx_rm)
         self.prot = np.delete(self.prot, idx_rm, axis = 1)
+        
+    def linearize(self,adj_matrix):
+        #linearizes the given matrix, such that each element only interacts with the other element, no matrix and no overlap
+        upper_tri = adj_matrix[np.triu_indices_from(adj_matrix, k=1)]
+        return upper_tri
+    
+    def expand_linearized_form(self, linearized, num_nodes):
+        # Create an empty adjacency matrix
+        adj_matrix = np.zeros((num_nodes, num_nodes), dtype=linearized.dtype)
+        
+        # Fill the upper triangular part of the matrix
+        adj_matrix[np.triu_indices_from(adj_matrix, k=1)] = linearized
+        
+        # Since the graph is undirected, mirror the upper triangular part to the lower part
+        adj_matrix = adj_matrix + adj_matrix.T
+        return adj_matrix
+    
+    def demographic_vec(self, demo):
+        #this will take in the demographic information and gives you the vector based on the patient ids and the demo_dict
+        demo_list = ['sex','bmi','age']
+        #find which one demo ois in the list
+        demo_idx = demo_list.index(demo)
+        demo_vec = np.zeros(self.prot.shape[0])
+        #and now we loop through
+        for i, patient_id in enumerate(self.patient_ids):
+            demo_vec[i] = self.demo_dict[patient_id][demo_idx]
+        #now replace all the nan  components with the mean
+        demo_vec[np.isnan(demo_vec)] = np.nanmean(demo_vec)
+        return demo_vec
